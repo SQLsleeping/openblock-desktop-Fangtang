@@ -32,3 +32,6 @@ npm-*
 # generated translation files
 /translations
 /locale
+
+# FangtangLink
+/doc/FangtangLink

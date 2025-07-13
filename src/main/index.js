@@ -626,3 +626,16 @@ const initialProjectDataPromise = (async () => {
 })(); // IIFE
 
 ipcMain.handle('get-initial-project-data', () => initialProjectDataPromise);
+
+// 远程烧录相关IPC处理程序
+ipcMain.handle('getRemoteFlasherConfig', () => {
+    return desktopLink.getRemoteFlasherConfig();
+});
+
+ipcMain.handle('setRemoteFlasherConfig', async (event, config) => {
+    return desktopLink.saveRemoteFlasherConfig(config.enabled, config.serverUrl);
+});
+
+ipcMain.handle('testRemoteFlasherConnection', async (event, serverUrl) => {
+    return await desktopLink.testRemoteFlasherConnection(serverUrl);
+});

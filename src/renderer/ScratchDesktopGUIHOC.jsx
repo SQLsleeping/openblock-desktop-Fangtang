@@ -49,7 +49,8 @@ const ScratchDesktopGUIHOC = function (WrappedComponent) {
                 'handleSetTitleFromSave',
                 'handleShowMessageBox',
                 'handleStorageInit',
-                'handleUpdateProjectTitle'
+                'handleUpdateProjectTitle',
+                'handleClickRemoteFlasherSettings'
             ]);
             this.props.onLoadingStarted();
             ipcRenderer.invoke('get-initial-project-data').then(async initialProjectData => {
@@ -136,6 +137,16 @@ const ScratchDesktopGUIHOC = function (WrappedComponent) {
         handleClickInstallDriver () {
             ipcRenderer.send('installDriver');
         }
+
+        handleClickRemoteFlasherSettings () {
+            console.log('Remote Flasher Settings clicked');
+            try {
+                this.showRemoteFlasherDialog();
+            } catch (error) {
+                console.error('Error in handleClickRemoteFlasherSettings:', error);
+                dialog.showErrorBox('Error', `Failed to open remote flasher settings: ${error.message}`);
+            }
+        }
         handleProjectTelemetryEvent (event, metadata) {
             ipcRenderer.send(event, metadata);
         }
@@ -147,6 +158,317 @@ const ScratchDesktopGUIHOC = function (WrappedComponent) {
         }
         handleUpdateProjectTitle (newTitle) {
             this.setState({projectTitle: newTitle});
+        }
+        async showRemoteFlasherDialog () {
+            console.log('showRemoteFlasherDialog called');
+            try {
+                // 获取当前配置
+                console.log('Getting remote flasher config...');
+                const currentConfig = await ipcRenderer.invoke('getRemoteFlasherConfig');
+                console.log('Current config:', currentConfig);
+
+                // 显示配置对话框
+                const result = await dialog.showMessageBox(remote.getCurrentWindow(), {
+                    type: 'question',
+                    title: 'Remote Flasher Settings',
+                    message: 'Configure Remote Flasher (FangtangLink)',
+                    detail: `Current status: ${currentConfig.enabled ? 'Enabled' : 'Disabled'}\n` +
+                           `Server URL: ${currentConfig.serverUrl || 'Not set'}\n\n` +
+                           'Would you like to configure remote flashing?',
+                    buttons: ['Configure', 'Test Connection', 'Disable', 'Cancel'],
+                    defaultId: 0,
+                    cancelId: 3
+                });
+
+                if (result.response === 0) {
+                    // 配置远程烧录
+                    this.showRemoteFlasherConfigDialog(currentConfig);
+                } else if (result.response === 1) {
+                    // 测试连接
+                    if (currentConfig.serverUrl) {
+                        this.testRemoteFlasherConnection(currentConfig.serverUrl);
+                    } else {
+                        dialog.showMessageBox(remote.getCurrentWindow(), {
+                            type: 'warning',
+                            title: 'No Server URL',
+                            message: 'Please configure a server URL first.'
+                        });
+                    }
+                } else if (result.response === 2) {
+                    // 禁用远程烧录
+                    await ipcRenderer.invoke('setRemoteFlasherConfig', {
+                        enabled: false,
+                        serverUrl: currentConfig.serverUrl
+                    });
+                    dialog.showMessageBox(remote.getCurrentWindow(), {
+                        type: 'info',
+                        title: 'Remote Flasher Disabled',
+                        message: 'Remote flashing has been disabled.'
+                    });
+                }
+            } catch (error) {
+                console.error('Error showing remote flasher dialog:', error);
+                dialog.showErrorBox('Error', 'Failed to show remote flasher settings.');
+            }
+        }
+        async showRemoteFlasherConfigDialog (currentConfig) {
+            // 使用更简单的方法获取用户输入
+            let serverUrl = null;
+
+            try {
+                // 首先显示当前配置
+                const configInfo = await dialog.showMessageBox(remote.getCurrentWindow(), {
+                    type: 'info',
+                    title: 'Current Configuration',
+                    message: 'Remote Flasher Configuration',
+                    detail: `Current server URL: ${currentConfig.serverUrl || 'Not configured'}\n\n` +
+                           'Click OK to enter a new server URL, or Cancel to abort.',
+                    buttons: ['Enter New URL', 'Cancel'],
+                    defaultId: 0,
+                    cancelId: 1
+                });
+
+                if (configInfo.response !== 0) {
+                    return; // 用户取消
+                }
+
+                // 使用简单的prompt获取输入
+                serverUrl = await this.showInputDialog(
+                    'Remote Flasher Configuration',
+                    'Enter the IP address or URL of your Raspberry Pi running FangtangLink:',
+                    currentConfig.serverUrl || 'http://192.168.0.109:5000'
+                );
+            } catch (error) {
+                console.error('Error in config dialog:', error);
+                dialog.showErrorBox('Error', 'Failed to show configuration dialog.');
+                return;
+            }
+
+            if (serverUrl) {
+                try {
+                    // 测试连接
+                    const testResult = await ipcRenderer.invoke('testRemoteFlasherConnection', serverUrl);
+
+                    if (testResult.success) {
+                        // 保存配置
+                        await ipcRenderer.invoke('setRemoteFlasherConfig', {
+                            enabled: true,
+                            serverUrl: serverUrl
+                        });
+
+                        dialog.showMessageBox(remote.getCurrentWindow(), {
+                            type: 'info',
+                            title: 'Remote Flasher Configured',
+                            message: `Remote flasher has been configured successfully!\n\nServer: ${serverUrl}\nStatus: Connected\n\nYou can now use "Remote Arduino (FangtangLink)" device for wireless programming.`
+                        });
+                    } else {
+                        const retry = await dialog.showMessageBox(remote.getCurrentWindow(), {
+                            type: 'warning',
+                            title: 'Connection Failed',
+                            message: `Failed to connect to remote flasher:\n${testResult.message}\n\nWould you like to save the configuration anyway?`,
+                            buttons: ['Save Anyway', 'Retry', 'Cancel'],
+                            defaultId: 1,
+                            cancelId: 2
+                        });
+
+                        if (retry.response === 0) {
+                            // 保存配置但不启用
+                            await ipcRenderer.invoke('setRemoteFlasherConfig', {
+                                enabled: false,
+                                serverUrl: serverUrl
+                            });
+
+                            dialog.showMessageBox(remote.getCurrentWindow(), {
+                                type: 'info',
+                                title: 'Configuration Saved',
+                                message: 'Configuration saved but remote flasher is disabled due to connection failure.'
+                            });
+                        } else if (retry.response === 1) {
+                            // 重试
+                            this.showRemoteFlasherConfigDialog({serverUrl: serverUrl});
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error configuring remote flasher:', error);
+                    dialog.showErrorBox('Error', 'Failed to configure remote flasher.');
+                }
+            }
+        }
+        async testRemoteFlasherConnection (serverUrl) {
+            try {
+                const testResult = await ipcRenderer.invoke('testRemoteFlasherConnection', serverUrl);
+
+                dialog.showMessageBox(remote.getCurrentWindow(), {
+                    type: testResult.success ? 'info' : 'warning',
+                    title: 'Connection Test',
+                    message: testResult.success ?
+                        `Connection successful!\n\nServer: ${serverUrl}\nStatus: ${testResult.message}` :
+                        `Connection failed!\n\nServer: ${serverUrl}\nError: ${testResult.message}`
+                });
+            } catch (error) {
+                console.error('Error testing remote flasher connection:', error);
+                dialog.showErrorBox('Error', 'Failed to test connection.');
+            }
+        }
+        async showInputDialog (title, message, defaultValue = '') {
+            // 简化的输入对话框实现
+            console.log('showInputDialog called:', { title, message, defaultValue });
+
+            return new Promise((resolve) => {
+                try {
+                    // 创建模态对话框元素
+                    const modal = document.createElement('div');
+                    modal.style.cssText = `
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        width: 100%;
+                        height: 100%;
+                        background-color: rgba(0, 0, 0, 0.7);
+                        z-index: 10000;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        font-family: Arial, sans-serif;
+                    `;
+
+                    const dialog = document.createElement('div');
+                    dialog.style.cssText = `
+                        background: white;
+                        padding: 20px;
+                        border-radius: 8px;
+                        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+                        max-width: 500px;
+                        width: 90%;
+                    `;
+
+                    const titleEl = document.createElement('h3');
+                    titleEl.textContent = title;
+                    titleEl.style.cssText = `
+                        margin: 0 0 10px 0;
+                        color: #333;
+                        font-size: 18px;
+                    `;
+
+                    const messageEl = document.createElement('p');
+                    messageEl.textContent = message;
+                    messageEl.style.cssText = `
+                        margin: 0 0 15px 0;
+                        color: #666;
+                        font-size: 14px;
+                        line-height: 1.4;
+                    `;
+
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.value = defaultValue || '';
+                    input.style.cssText = `
+                        width: 100%;
+                        padding: 10px;
+                        border: 2px solid #ddd;
+                        border-radius: 4px;
+                        font-size: 14px;
+                        margin-bottom: 15px;
+                        box-sizing: border-box;
+                    `;
+
+                    const buttonContainer = document.createElement('div');
+                    buttonContainer.style.cssText = `
+                        display: flex;
+                        justify-content: flex-end;
+                        gap: 10px;
+                    `;
+
+                    const cancelBtn = document.createElement('button');
+                    cancelBtn.textContent = 'Cancel';
+                    cancelBtn.style.cssText = `
+                        padding: 8px 16px;
+                        border: 1px solid #ddd;
+                        background: #f5f5f5;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-size: 14px;
+                    `;
+
+                    const okBtn = document.createElement('button');
+                    okBtn.textContent = 'OK';
+                    okBtn.style.cssText = `
+                        padding: 8px 16px;
+                        border: 1px solid #007acc;
+                        background: #007acc;
+                        color: white;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-size: 14px;
+                    `;
+
+                    // 组装对话框
+                    dialog.appendChild(titleEl);
+                    dialog.appendChild(messageEl);
+                    dialog.appendChild(input);
+                    buttonContainer.appendChild(cancelBtn);
+                    buttonContainer.appendChild(okBtn);
+                    dialog.appendChild(buttonContainer);
+                    modal.appendChild(dialog);
+
+                    // 添加到页面
+                    document.body.appendChild(modal);
+
+                    // 聚焦输入框
+                    setTimeout(() => {
+                        input.focus();
+                        input.select();
+                    }, 100);
+
+                    const cleanup = () => {
+                        if (modal.parentNode) {
+                            document.body.removeChild(modal);
+                        }
+                    };
+
+                    const handleOk = () => {
+                        const value = input.value.trim();
+                        cleanup();
+                        resolve(value || null);
+                    };
+
+                    const handleCancel = () => {
+                        cleanup();
+                        resolve(null);
+                    };
+
+                    // 事件监听
+                    okBtn.addEventListener('click', handleOk);
+                    cancelBtn.addEventListener('click', handleCancel);
+
+                    input.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleOk();
+                        } else if (e.key === 'Escape') {
+                            e.preventDefault();
+                            handleCancel();
+                        }
+                    });
+
+                    modal.addEventListener('click', (e) => {
+                        if (e.target === modal) {
+                            handleCancel();
+                        }
+                    });
+
+                } catch (error) {
+                    console.error('Error creating input dialog:', error);
+                    // 备用方案
+                    try {
+                        const result = prompt(`${title}\n\n${message}`, defaultValue);
+                        resolve(result);
+                    } catch (promptError) {
+                        console.error('Prompt fallback failed:', promptError);
+                        resolve(null);
+                    }
+                }
+            });
         }
         handleShowMessageBox (type, message) {
             /**
@@ -218,6 +540,14 @@ const ScratchDesktopGUIHOC = function (WrappedComponent) {
                             id="gui.menuBar.dataSettings"
                         />),
                         onClick: () => this.props.onTelemetrySettingsClicked()
+                    },
+                    {
+                        title: (<FormattedMessage
+                            defaultMessage="Remote Flasher Settings"
+                            description="Menu bar item for remote flasher settings"
+                            id="gui.menuBar.remoteFlasherSettings"
+                        />),
+                        onClick: () => this.handleClickRemoteFlasherSettings()
                     }
                 ]}
                 onClickLogo={this.handleClickLogo}
