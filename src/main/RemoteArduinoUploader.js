@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawn } = require('child_process');
 
 /**
  * 远程Arduino上传器
@@ -41,24 +42,287 @@ class RemoteArduinoUploader {
      * 构建代码（本地编译）
      */
     async build(code) {
-        // 这里复用原有的Arduino类的build方法
-        // 为了简化，我们假设已经有编译好的hex文件
-        // 实际实现中需要调用原有的Arduino.build方法
-        
         if (!fs.existsSync(this._codeFolderPath)) {
             fs.mkdirSync(this._codeFolderPath, {recursive: true});
         }
 
+        if (!fs.existsSync(this._buildPath)) {
+            fs.mkdirSync(this._buildPath, {recursive: true});
+        }
+
         try {
+            // 保存代码文件
             fs.writeFileSync(this._codeFilePath, code);
-            this._sendstd('Code saved for remote compilation...\n');
-            
-            // 这里应该调用原有的编译逻辑
-            // 为了演示，我们假设编译成功
-            return 'Success';
+            this._sendstd('Code saved, starting compilation...\n');
+
+            // 使用arduino-cli进行编译
+            return await this.compileWithArduinoCli();
         } catch (err) {
             throw err;
         }
+    }
+
+    /**
+     * 使用arduino-cli编译代码
+     */
+    async compileWithArduinoCli() {
+        const arduinoCliPath = this.getArduinoCliPath();
+
+        // 检查arduino-cli是否真的存在
+        if (arduinoCliPath === 'arduino-cli') {
+            // 如果返回的是默认名称，先测试是否可用
+            try {
+                const { execSync } = require('child_process');
+                execSync('arduino-cli version', { stdio: 'pipe' });
+                this._sendstd('Found arduino-cli in system PATH\n');
+            } catch (error) {
+                this._sendstd('Arduino CLI not found in system PATH\n');
+                this._sendstd('Please install Arduino CLI:\n');
+                this._sendstd('  macOS: brew install arduino-cli\n');
+                this._sendstd('  Linux: curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh\n');
+                this._sendstd('  Windows: Download from https://github.com/arduino/arduino-cli/releases\n');
+                throw new Error('Arduino CLI not found. Please install arduino-cli.');
+            }
+        }
+
+        // 确保必要的平台已安装
+        await this.ensureArduinoPlatforms(arduinoCliPath);
+
+        return new Promise((resolve, reject) => {
+            const args = [
+                'compile',
+                '--fqbn', this._config.fqbn,
+                '--build-path', this._buildPath,
+                '--output-dir', this._buildPath,
+                this._codeFolderPath
+            ];
+
+            this._sendstd(`Compiling with: ${arduinoCliPath} ${args.join(' ')}\n`);
+
+            const process = spawn(arduinoCliPath, args, {
+                cwd: this._codeFolderPath,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            let output = '';
+            let errorOutput = '';
+
+            process.stdout.on('data', (data) => {
+                const text = data.toString();
+                output += text;
+                this._sendstd(text);
+            });
+
+            process.stderr.on('data', (data) => {
+                const text = data.toString();
+                errorOutput += text;
+                this._sendstd(text);
+            });
+
+            process.on('close', (code) => {
+                if (code === 0) {
+                    this._sendstd('Local compilation successful!\n');
+                    resolve('Success');
+                } else {
+                    this._sendstd(`Local compilation failed with code ${code}\n`);
+                    reject(new Error(`Compilation failed: ${errorOutput || output}`));
+                }
+            });
+
+            process.on('error', (error) => {
+                this._sendstd(`Local compilation error: ${error.message}\n`);
+                reject(error);
+            });
+        });
+    }
+
+    /**
+     * 确保必要的Arduino平台已安装
+     */
+    async ensureArduinoPlatforms(arduinoCliPath) {
+        const { execSync } = require('child_process');
+
+        try {
+            // 检查系统架构
+            const arch = os.arch();
+            const platform = os.platform();
+
+            this._sendstd(`System: ${platform} ${arch}\n`);
+
+            // 在Apple Silicon Mac上，检查是否需要使用Rosetta
+            if (platform === 'darwin' && arch === 'arm64') {
+                this._sendstd('Detected Apple Silicon Mac. Arduino CLI tools may need Rosetta 2.\n');
+
+                // 检查是否安装了Rosetta 2
+                try {
+                    execSync('pgrep oahd', { stdio: 'pipe' });
+                    this._sendstd('Rosetta 2 is available.\n');
+                } catch (error) {
+                    this._sendstd('Warning: Rosetta 2 may not be installed. Some Arduino tools may not work.\n');
+                    this._sendstd('To install Rosetta 2, run: softwareupdate --install-rosetta\n');
+                }
+            }
+
+            // 获取FQBN中的平台信息
+            const platformName = this.getPlatformFromFqbn();
+
+            this._sendstd(`Checking if platform ${platformName} is installed...\n`);
+
+            // 检查平台是否已安装
+            try {
+                const installedPlatforms = execSync(`"${arduinoCliPath}" core list`, { encoding: 'utf8' });
+                if (installedPlatforms.includes(platformName)) {
+                    this._sendstd(`Platform ${platformName} is already installed\n`);
+
+                    // 在Apple Silicon上，尝试测试编译工具是否工作
+                    if (platform === 'darwin' && arch === 'arm64') {
+                        return await this.testCompilerCompatibility(arduinoCliPath, platformName);
+                    }
+                    return;
+                }
+            } catch (error) {
+                // 继续安装
+            }
+
+            this._sendstd(`Installing platform ${platformName}...\n`);
+
+            // 更新索引
+            this._sendstd('Updating package index...\n');
+            execSync(`"${arduinoCliPath}" core update-index`, {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                encoding: 'utf8'
+            });
+
+            // 安装平台
+            this._sendstd(`Installing ${platformName}...\n`);
+            const installOutput = execSync(`"${arduinoCliPath}" core install ${platformName}`, {
+                encoding: 'utf8',
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            this._sendstd(installOutput);
+            this._sendstd(`Platform ${platformName} installed successfully!\n`);
+
+            // 在Apple Silicon上，测试编译工具兼容性
+            if (platform === 'darwin' && arch === 'arm64') {
+                await this.testCompilerCompatibility(arduinoCliPath, platformName);
+            }
+
+        } catch (error) {
+            this._sendstd(`Warning: Failed to install platform: ${error.message}\n`);
+
+            // 在Apple Silicon上提供特殊建议
+            if (os.platform() === 'darwin' && os.arch() === 'arm64') {
+                this._sendstd('\nApple Silicon Mac detected. Try these solutions:\n');
+                this._sendstd('1. Install Rosetta 2: softwareupdate --install-rosetta\n');
+                this._sendstd('2. Use Arduino IDE 2.x which has native ARM64 support\n');
+                this._sendstd('3. Or use remote compilation (will skip local compilation)\n');
+            }
+
+            this._sendstd('You may need to install the platform manually:\n');
+            this._sendstd(`  arduino-cli core install ${this.getPlatformFromFqbn()}\n`);
+            // 不抛出错误，让编译继续尝试
+        }
+    }
+
+    /**
+     * 从FQBN获取平台信息
+     */
+    getPlatformFromFqbn() {
+        // FQBN格式: vendor:architecture:board[:parameters]
+        // 例如: arduino:avr:nano:cpu=atmega328old
+        const parts = this._config.fqbn.split(':');
+        if (parts.length >= 2) {
+            return `${parts[0]}:${parts[1]}`;
+        }
+        return 'arduino:avr'; // 默认
+    }
+
+    /**
+     * 测试编译工具兼容性（Apple Silicon特定）
+     */
+    async testCompilerCompatibility(arduinoCliPath, platformName) {
+        const { execSync } = require('child_process');
+        const os = require('os');
+
+        try {
+            const platform = os.platform();
+            const arch = os.arch();
+
+            this._sendstd(`System: ${platform} ${arch}\n`);
+
+            if (platform === 'darwin' && arch === 'arm64') {
+                this._sendstd('Detected Apple Silicon Mac. Arduino CLI tools may need Rosetta 2.\n');
+
+                // 检查Rosetta 2是否可用
+                try {
+                    execSync('arch -x86_64 uname -m', { stdio: 'pipe' });
+                    this._sendstd('Rosetta 2 is available.\n');
+                } catch (error) {
+                    this._sendstd('Rosetta 2 is not available. Some Arduino tools may not work.\n');
+                    this._sendstd('Install Rosetta 2 with: softwareupdate --install-rosetta\n');
+                }
+            }
+
+        } catch (error) {
+            this._sendstd(`Apple Silicon Mac detected. Try these solutions:\n`);
+            this._sendstd(`1. Install Rosetta 2: softwareupdate --install-rosetta\n`);
+            this._sendstd(`2. Use Arduino IDE 2.x which has native ARM64 support\n`);
+            this._sendstd(`3. Or use remote compilation (will skip local compilation)\n`);
+            throw error;
+        }
+    }
+
+    /**
+     * 获取arduino-cli路径
+     */
+    getArduinoCliPath() {
+        // 根据平台查找arduino-cli
+        const platform = os.platform();
+        let cliName = 'arduino-cli';
+
+        if (platform === 'win32') {
+            cliName = 'arduino-cli.exe';
+        }
+
+        // 可能的arduino-cli路径
+        const possiblePaths = [
+            // tools目录中的arduino-cli
+            path.join(this._toolsPath, 'arduino-cli', cliName),
+            path.join(this._toolsPath, 'arduino-cli', 'bin', cliName),
+            path.join(this._toolsPath, cliName),
+            // 系统常见路径
+            `/usr/local/bin/${cliName}`,
+            `/usr/bin/${cliName}`,
+            `/opt/homebrew/bin/${cliName}`,
+            // macOS应用程序路径
+            `/Applications/Arduino IDE.app/Contents/MacOS/arduino-cli`,
+            `/Applications/Arduino.app/Contents/Java/tools/arduino-cli`,
+        ];
+
+        // 检查每个可能的路径
+        for (const cliPath of possiblePaths) {
+            if (fs.existsSync(cliPath)) {
+                this._sendstd(`Found arduino-cli at: ${cliPath}\n`);
+                return cliPath;
+            }
+        }
+
+        // 如果都找不到，尝试使用which命令查找
+        try {
+            const { execSync } = require('child_process');
+            const whichResult = execSync(`which ${cliName}`, { encoding: 'utf8' }).trim();
+            if (whichResult && fs.existsSync(whichResult)) {
+                this._sendstd(`Found arduino-cli via which: ${whichResult}\n`);
+                return whichResult;
+            }
+        } catch (error) {
+            // which命令失败，继续
+        }
+
+        // 最后尝试系统PATH
+        this._sendstd(`Arduino-cli not found in common paths, trying system PATH...\n`);
+        return cliName;
     }
 
     /**
@@ -70,50 +334,109 @@ class RemoteArduinoUploader {
         }
 
         try {
-            this._sendstd('Starting remote flash operation...\n');
+            this._sendstd('Using remote flasher for upload...\n');
+
+            // 测试连接
+            this._sendstd('Testing remote flasher connection...\n');
+            const connectionTest = await this._remoteFlasherClient.testConnection();
+            if (!connectionTest.success) {
+                throw new Error(`Connection failed: ${connectionTest.message}`);
+            }
+            this._sendstd('Remote flasher connection OK\n');
 
             let hexFilePath;
             if (firmwarePath) {
+                // 如果提供了固件路径，直接使用
                 hexFilePath = firmwarePath;
+                this._sendstd(`Using provided firmware: ${hexFilePath}\n`);
             } else {
-                // 查找编译生成的hex文件
+                // 查找本地编译生成的hex文件
                 hexFilePath = this.findHexFile();
+
                 if (!hexFilePath) {
-                    throw new Error('No hex file found for flashing');
+                    throw new Error('No hex file found for flashing. Please ensure compilation was successful.');
                 }
+
+                this._sendstd(`Found local hex file: ${hexFilePath}\n`);
             }
 
-            this._sendstd(`Flashing ${hexFilePath} to remote device...\n`);
+            this._sendstd(`Starting remote Arduino operation...\n`);
 
-            // 准备烧录选项
-            const flashOptions = {
+            // 准备Arduino操作选项
+            const operationOptions = {
                 mcu: this.getMcuFromFqbn(),
                 programmer: 'arduino',
-                port: this._peripheralPath === 'remote-flasher-device' ? '/dev/ttyS0' : this._peripheralPath,
+                port: '/dev/ttyS0', // 使用正确的串口
                 baudrate: 115200
             };
 
-            // 使用流式烧录获取实时输出
-            const result = await this._remoteFlasherClient.flashFileStream(
+            // 使用流式Arduino操作API
+            this._sendstd('Starting Arduino stream operation via API...\n');
+            const result = await this._remoteFlasherClient.performArduinoOperation(
                 hexFilePath,
-                flashOptions,
+                operationOptions,
                 (data) => {
-                    // 实时输出烧录过程
+                    // 实时输出格式化的操作过程
                     this._sendstd(data);
                 }
             );
 
             if (result.success) {
-                this._sendstd('Remote flash completed successfully!\n');
+                this._sendstd('\n🎉 Remote Arduino operation completed successfully!\n');
+                if (result.message) {
+                    this._sendstd(`Final message: ${result.message}\n`);
+                }
                 return 'Success';
             } else {
-                throw new Error(result.message || 'Remote flash failed');
+                throw new Error(result.error || result.message || 'Stream operation failed');
             }
 
         } catch (error) {
-            this._sendstd(`Remote flash error: ${error.message}\n`);
-            throw error;
+            const errorMessage = error.message || 'Unknown error';
+            this._sendstd(`Remote Arduino operation failed: ${errorMessage}\n`);
+            throw new Error(`Remote Arduino operation failed: ${errorMessage}`);
         }
+    }
+
+
+
+    /**
+     * 格式化avrdude输出
+     */
+    formatAvrdudeOutput(output) {
+        if (!output) return '';
+
+        // 移除多余的空行和格式化输出
+        const lines = output.split('\n');
+        const formattedLines = [];
+
+        for (let line of lines) {
+            line = line.trim();
+            if (line) {
+                // 高亮重要信息
+                if (line.includes('avrdude: Version')) {
+                    formattedLines.push(`📋 ${line}`);
+                } else if (line.includes('device signature')) {
+                    formattedLines.push(`🔍 ${line}`);
+                } else if (line.includes('writing') && line.includes('flash')) {
+                    formattedLines.push(`📝 ${line}`);
+                } else if (line.includes('Writing |') || line.includes('Reading |')) {
+                    formattedLines.push(`⏳ ${line}`);
+                } else if (line.includes('bytes of flash written')) {
+                    formattedLines.push(`✅ ${line}`);
+                } else if (line.includes('bytes of flash verified')) {
+                    formattedLines.push(`✅ ${line}`);
+                } else if (line.includes('avrdude done')) {
+                    formattedLines.push(`🎉 ${line}`);
+                } else if (line.includes('error') || line.includes('Error')) {
+                    formattedLines.push(`❌ ${line}`);
+                } else {
+                    formattedLines.push(`   ${line}`);
+                }
+            }
+        }
+
+        return formattedLines.join('\n');
     }
 
     /**

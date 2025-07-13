@@ -481,24 +481,34 @@ class RemoteFlasherClient {
      * 从URL烧录hex文件
      */
     async flashUrl(url, options = {}) {
+        this.log('Flashing from URL:', url);
         try {
             const requestData = {
                 url: url,
                 ...options
             };
 
-            const response = await this.axios.post(`${this.serverUrl}/flash/url`, requestData, {
-                timeout: 120000 // 烧录可能需要更长时间
-            });
+            const response = await this.makeRequest('POST', '/flash/url', requestData);
 
-            return {
-                success: true,
-                data: response.data
-            };
+            if (response.success && response.status === 200) {
+                this.log('Flash URL request successful');
+                return {
+                    success: true,
+                    data: response.data
+                };
+            } else {
+                this.logError('Flash URL request failed', response);
+                return {
+                    success: false,
+                    error: response.data || 'Unknown error',
+                    message: 'Failed to flash from URL to remote device'
+                };
+            }
         } catch (error) {
+            this.logError('Flash URL request error', error);
             return {
                 success: false,
-                error: error.message,
+                error: error.error || error.message,
                 message: 'Failed to flash from URL to remote device'
             };
         }
@@ -508,6 +518,7 @@ class RemoteFlasherClient {
      * 获取设备信息
      */
     async getDeviceInfo(options = {}) {
+        this.log('Getting device info...', options);
         try {
             const params = new URLSearchParams();
             if (options.mcu) params.append('mcu', options.mcu);
@@ -515,16 +526,27 @@ class RemoteFlasherClient {
             if (options.port) params.append('port', options.port);
             if (options.baudrate) params.append('baudrate', options.baudrate.toString());
 
-            const response = await this.axios.get(`${this.serverUrl}/device/info?${params.toString()}`);
-            
-            return {
-                success: true,
-                data: response.data
-            };
+            const response = await this.makeRequest('GET', `/device/info?${params.toString()}`);
+
+            if (response.success && response.status === 200) {
+                this.log('Device info request successful');
+                return {
+                    success: true,
+                    data: response.data
+                };
+            } else {
+                this.logError('Device info request failed', response);
+                return {
+                    success: false,
+                    error: response.data || 'Unknown error',
+                    message: 'Failed to get device information'
+                };
+            }
         } catch (error) {
+            this.logError('Device info request error', error);
             return {
                 success: false,
-                error: error.message,
+                error: error.error || error.message,
                 message: 'Failed to get device information'
             };
         }
@@ -534,31 +556,46 @@ class RemoteFlasherClient {
      * 控制设备复位
      */
     async controlReset(reset = true, duration = 0.2) {
+        this.log('Controlling device reset...', { reset, duration });
         try {
             const requestData = {
                 reset: reset,
                 duration: duration
             };
 
-            const response = await this.axios.post(`${this.serverUrl}/control/reset`, requestData);
-            
-            return {
-                success: true,
-                data: response.data
-            };
+            const response = await this.makeRequest('POST', '/control/reset', requestData);
+
+            if (response.success && response.status === 200) {
+                this.log('Reset control request successful');
+                return {
+                    success: true,
+                    data: response.data
+                };
+            } else {
+                this.logError('Reset control request failed', response);
+                return {
+                    success: false,
+                    error: response.data || 'Unknown error',
+                    message: 'Failed to control device reset'
+                };
+            }
         } catch (error) {
+            this.logError('Reset control request error', error);
             return {
                 success: false,
-                error: error.message,
+                error: error.error || error.message,
                 message: 'Failed to control device reset'
             };
         }
     }
 
+
+
     /**
-     * 流式烧录（实时获取输出）
+     * 执行完整的Arduino操作（推荐使用）
      */
-    async flashFileStream(hexFilePath, options = {}, onData = null) {
+    async performArduinoOperation(hexFilePath, options = {}, onData = null) {
+        this.log('Starting Arduino operation...', { hexFilePath, options });
         try {
             if (!fs.existsSync(hexFilePath)) {
                 return {
@@ -567,27 +604,244 @@ class RemoteFlasherClient {
                 };
             }
 
-            const formData = new FormData();
-            formData.append('file', fs.createReadStream(hexFilePath));
-            
-            // 添加可选参数
-            if (options.mcu) formData.append('mcu', options.mcu);
-            if (options.programmer) formData.append('programmer', options.programmer);
-            if (options.port) formData.append('port', options.port);
-            if (options.baudrate) formData.append('baudrate', options.baudrate.toString());
+            // 使用curl进行文件上传到Arduino操作端点
+            const curlArgs = [
+                '-X', 'POST',
+                '-H', 'User-Agent: OpenBlock-Desktop-RemoteFlasher/1.0',
+                '-H', 'Accept: text/plain',
+                '--connect-timeout', '10',
+                '--max-time', '120', // Arduino操作可能需要更长时间
+                '-N', // 禁用缓冲，实时输出
+                '--fail-with-body', // return body even on HTTP errors
+                '-F', `file=@${hexFilePath}` // 文件上传
+            ];
 
-            const response = await this.axios.post(`${this.serverUrl}/flash/stream`, formData, {
-                headers: {
-                    ...formData.getHeaders()
-                },
-                timeout: 120000,
-                responseType: 'stream'
-            });
+            // 添加可选参数
+            if (options.mcu) curlArgs.push('-F', `mcu=${options.mcu}`);
+            if (options.programmer) curlArgs.push('-F', `programmer=${options.programmer}`);
+            if (options.port) curlArgs.push('-F', `port=${options.port}`);
+            if (options.baudrate) curlArgs.push('-F', `baudrate=${options.baudrate}`);
+
+            // 构建查询参数
+            const queryParams = new URLSearchParams();
+            if (options.mcu) queryParams.append('mcu', options.mcu);
+            if (options.programmer) queryParams.append('programmer', options.programmer);
+            if (options.port) queryParams.append('port', options.port);
+            if (options.baudrate) queryParams.append('baudrate', options.baudrate);
+
+            const url = `${this.serverUrl}/flash/stream?${queryParams.toString()}`;
+            curlArgs.push(url);
+
+            this.log('Curl command for stream operation:', `curl ${curlArgs.join(' ')}`);
 
             return new Promise((resolve, reject) => {
+                const { spawn } = require('child_process');
+                const curl = spawn('curl', curlArgs);
+                let hasError = false;
+                let lastMessage = '';
+                let isSuccess = false;
+                let successMessage = ''; // 专门记录成功消息
+                let allMessages = []; // 记录所有消息用于最终判断
+
+                curl.stdout.on('data', (chunk) => {
+                    const data = chunk.toString();
+
+                    // 解析流式数据
+                    const lines = data.split('\n');
+                    for (const line of lines) {
+                        if (line.trim().startsWith('data: ')) {
+                            try {
+                                const jsonStr = line.trim().substring(6); // 移除 "data: " 前缀
+                                const streamData = JSON.parse(jsonStr);
+
+                                // 实时输出格式化的消息
+                                if (onData) {
+                                    this.formatStreamMessage(streamData, onData);
+                                }
+
+                                // 记录消息和状态
+                                const message = streamData.message || '';
+                                allMessages.push(message); // 记录所有消息
+
+                                // 检查消息内容来判断成功状态
+                                if (message.includes('Flash completed successfully')) {
+                                    isSuccess = true;
+                                    successMessage = message;
+                                    this.log('Found success message:', message);
+                                } else if (streamData.type === 'error' || message.includes('Flash failed')) {
+                                    hasError = true;
+                                    lastMessage = message || 'Flash operation failed';
+                                    this.log('Found error message:', message);
+                                }
+
+                                // 更新最后消息
+                                lastMessage = message;
+
+                            } catch (parseError) {
+                                // 忽略解析错误，可能是不完整的数据
+                            }
+                        }
+                    }
+                });
+
+                curl.stderr.on('data', (chunk) => {
+                    const errorData = chunk.toString();
+                    this.log('Curl stderr:', errorData);
+                    hasError = true;
+                });
+
+                curl.on('close', (code) => {
+                    this.log(`Curl stream operation process exited with code: ${code}`);
+                    this.log(`Final state - isSuccess: ${isSuccess}, hasError: ${hasError}, successMessage: "${successMessage}"`);
+                    this.log(`All messages: ${JSON.stringify(allMessages)}`);
+
+                    // 最终检查：在所有消息中查找成功标志
+                    let finalSuccess = isSuccess;
+                    let finalSuccessMessage = successMessage;
+
+                    if (!finalSuccess) {
+                        // 如果还没有找到成功标志，再次检查所有消息
+                        for (const msg of allMessages) {
+                            if (msg.includes('Flash completed successfully')) {
+                                finalSuccess = true;
+                                finalSuccessMessage = msg;
+                                this.log('Found success in final check:', msg);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (code === 0 && finalSuccess) {
+                        // 找到成功消息
+                        resolve({
+                            success: true,
+                            message: finalSuccessMessage,
+                            data: { success: true, message: finalSuccessMessage }
+                        });
+                    } else if (hasError || code !== 0) {
+                        // 明确的错误状态或curl进程错误
+                        const errorMsg = hasError ? lastMessage : `Stream operation failed with code ${code}`;
+                        reject({
+                            success: false,
+                            error: errorMsg,
+                            message: errorMsg
+                        });
+                    } else {
+                        // 没有找到明确的成功或错误标志
+                        reject({
+                            success: false,
+                            error: 'No clear success or error indication found',
+                            message: lastMessage || 'Unknown operation result'
+                        });
+                    }
+                });
+
+                curl.on('error', (error) => {
+                    this.logError('Curl spawn error', error);
+                    reject({
+                        success: false,
+                        error: error.message,
+                        message: 'Failed to start stream operation'
+                    });
+                });
+            });
+        } catch (error) {
+            this.logError('Arduino operation error', error);
+            return {
+                success: false,
+                error: error.message,
+                message: 'Failed to start Arduino operation'
+            };
+        }
+    }
+
+    /**
+     * 格式化流式消息输出
+     */
+    formatStreamMessage(streamData, onData) {
+        const { type, message } = streamData;
+
+        let formattedMessage = '';
+
+        switch (type) {
+            case 'info':
+                formattedMessage = `ℹ️  ${message}`;
+                break;
+            case 'output':
+                // 格式化avrdude输出
+                if (message.includes('avrdude: Version')) {
+                    formattedMessage = `📋 ${message}`;
+                } else if (message.includes('device signature')) {
+                    formattedMessage = `🔍 ${message}`;
+                } else if (message.includes('writing') && message.includes('flash')) {
+                    formattedMessage = `📝 ${message}`;
+                } else if (message.includes('Writing |') || message.includes('Reading |')) {
+                    formattedMessage = `⏳ ${message}`;
+                } else if (message.includes('bytes of flash written')) {
+                    formattedMessage = `✅ ${message}`;
+                } else if (message.includes('bytes of flash verified')) {
+                    formattedMessage = `✅ ${message}`;
+                } else if (message.includes('avrdude done')) {
+                    formattedMessage = `🎉 ${message}`;
+                } else {
+                    formattedMessage = `   ${message}`;
+                }
+                break;
+            case 'success':
+                formattedMessage = `🎉 ${message}`;
+                break;
+            case 'error':
+                formattedMessage = `❌ ${message}`;
+                break;
+            default:
+                formattedMessage = `   ${message}`;
+        }
+
+        onData(formattedMessage + '\n');
+    }
+
+    /**
+     * 流式烧录（实时获取输出）
+     */
+    async flashFileStream(hexFilePath, options = {}, onData = null) {
+        this.log('Starting stream flash operation...', { hexFilePath, options });
+        try {
+            if (!fs.existsSync(hexFilePath)) {
+                return {
+                    success: false,
+                    message: `File not found: ${hexFilePath}`
+                };
+            }
+
+            // 使用curl进行流式文件上传
+            const curlArgs = [
+                '-X', 'POST',
+                '-H', 'User-Agent: OpenBlock-Desktop-RemoteFlasher/1.0',
+                '-H', 'Accept: text/plain',
+                '--connect-timeout', '10',
+                '--max-time', '120', // 烧录可能需要更长时间
+                '-N', // 禁用缓冲，实时输出
+                '--fail-with-body', // return body even on HTTP errors
+                '-F', `file=@${hexFilePath}` // 文件上传
+            ];
+
+            // 添加可选参数
+            if (options.mcu) curlArgs.push('-F', `mcu=${options.mcu}`);
+            if (options.programmer) curlArgs.push('-F', `programmer=${options.programmer}`);
+            if (options.port) curlArgs.push('-F', `port=${options.port}`);
+            if (options.baudrate) curlArgs.push('-F', `baudrate=${options.baudrate}`);
+
+            curlArgs.push(`${this.serverUrl}/flash/stream`);
+
+            this.log('Curl command for stream upload:', `curl ${curlArgs.join(' ')}`);
+
+            return new Promise((resolve, reject) => {
+                const { spawn } = require('child_process');
+                const curl = spawn('curl', curlArgs);
                 let output = '';
-                
-                response.data.on('data', (chunk) => {
+                let hasError = false;
+
+                curl.stdout.on('data', (chunk) => {
                     const data = chunk.toString();
                     output += data;
                     if (onData) {
@@ -595,22 +849,40 @@ class RemoteFlasherClient {
                     }
                 });
 
-                response.data.on('end', () => {
-                    resolve({
-                        success: true,
-                        output: output
-                    });
+                curl.stderr.on('data', (chunk) => {
+                    const errorData = chunk.toString();
+                    this.log('Curl stderr:', errorData);
+                    hasError = true;
                 });
 
-                response.data.on('error', (error) => {
+                curl.on('close', (code) => {
+                    this.log(`Curl stream process exited with code: ${code}`);
+
+                    if (code === 0 && !hasError) {
+                        resolve({
+                            success: true,
+                            output: output
+                        });
+                    } else {
+                        reject({
+                            success: false,
+                            error: `Curl failed with code ${code}`,
+                            output: output
+                        });
+                    }
+                });
+
+                curl.on('error', (error) => {
+                    this.logError('Curl spawn error', error);
                     reject({
                         success: false,
                         error: error.message,
-                        message: 'Stream error during flash operation'
+                        message: 'Failed to start stream flash operation'
                     });
                 });
             });
         } catch (error) {
+            this.logError('Stream flash operation error', error);
             return {
                 success: false,
                 error: error.message,
